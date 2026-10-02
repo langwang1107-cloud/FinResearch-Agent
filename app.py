@@ -1,0 +1,119 @@
+import time
+import streamlit as st
+import plotly.graph_objects as go
+from concurrent.futures import ThreadPoolExecutor
+from agent.tools.stock import get_price_history, get_stock_data
+from agent.tools.news import get_company_news
+from agent.tools.sec import get_sec_filings
+from agent.core import stream_synthesis
+from agent.react_agent import answer_question
+from cache import get_cached_response
+
+
+def _escape_dollars(text: str) -> str:
+    """Escape '$' so Streamlit's Markdown doesn't interpret '$...$' as LaTeX math
+    (math mode silently strips spaces inside dollar amounts, corrupting figures
+    like '$5.15 trillion and ... $253.5 billion')."""
+    return text.replace("$", "\\$") if text else text
+
+
+st.set_page_config(
+    page_title="Financial Research Agent",
+    page_icon="📈",
+    layout="centered"
+)
+
+st.title("📈 Financial Research Agent")
+st.caption("Powered by Claude AI — Enter a stock ticker to generate an investment brief")
+
+ticker = st.text_input(
+    "Stock Ticker",
+    placeholder="e.g. AAPL, TSLA, NVDA",
+    max_chars=10
+).upper().strip()
+
+if st.button("Generate Brief", type="primary", disabled=not ticker):
+
+    # Price chart
+    with st.spinner("Fetching price data..."):
+        try:
+            history = get_price_history.invoke({"ticker": ticker})
+            if "error" not in history:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=history["dates"],
+                    y=history["prices"],
+                    mode="lines",
+                    line=dict(color="#1f77b4", width=2),
+                    fill="tozeroy",
+                    fillcolor="rgba(31, 119, 180, 0.1)"
+                ))
+                change = history["change_pct"]
+                color = "green" if change >= 0 else "red"
+                fig.update_layout(
+                    title=f"{ticker} — 12 Month Price History  "
+                          f"<span style='color:{color}'>({'+' if change >= 0 else ''}{change}%)</span>",
+                    xaxis_title="Date",
+                    yaxis_title="Price (USD)",
+                    height=350,
+                    margin=dict(l=0, r=0, t=40, b=0),
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    xaxis=dict(showgrid=False),
+                    yaxis=dict(showgrid=True, gridcolor="rgba(128,128,128,0.2)")
+                )
+                st.plotly_chart(fig, width="stretch")
+        except Exception as e:
+            st.warning(f"Could not load price chart: {str(e)}")
+
+    # Investment brief
+    cached = get_cached_response(ticker)
+    if cached:
+        st.markdown(_escape_dollars(cached["result"]))
+    else:
+        try:
+            # Data fetch phase — show live status so the user isn't staring at a blank screen
+            with st.status("Gathering data...", expanded=True) as status:
+                status.write("📊 Fetching stock data...")
+                t0 = time.perf_counter()
+                stock_data = get_stock_data.invoke({"ticker": ticker})
+                print(f"[timing:{ticker}] stock_data={time.perf_counter()-t0:.2f}s")
+                company_name = stock_data.get("company_name", ticker)
+
+                status.write("📰 Fetching news and SEC filings...")
+                t1 = time.perf_counter()
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    f_news = executor.submit(get_company_news.invoke, {"company_name": company_name})
+                    f_sec = executor.submit(get_sec_filings.invoke, {"ticker": ticker})
+                    news_data = f_news.result()
+                    sec_data = f_sec.result()
+                print(f"[timing:{ticker}] news+SEC(parallel)={time.perf_counter()-t1:.2f}s")
+
+                status.update(label="Data ready — generating brief...", state="complete", expanded=False)
+
+            # LLM phase — render the full brief as one markdown block, escaping
+            # '$' so Streamlit doesn't parse dollar amounts as LaTeX math.
+            brief = "".join(stream_synthesis(ticker, stock_data, news_data, sec_data))
+            st.markdown(_escape_dollars(brief))
+
+        except Exception as e:
+            st.error(f"Something went wrong: {str(e)}")
+
+if ticker:
+    st.divider()
+    st.subheader("💬 Ask a follow-up question")
+    followup = st.text_input(
+        "Question about this stock",
+        placeholder="e.g. How does revenue compare year over year?",
+        key="followup_input",
+    )
+    if st.button("Ask", key="ask_btn", disabled=not followup):
+        with st.spinner(f"Researching {ticker}..."):
+            try:
+                answer = answer_question(ticker, followup)
+                st.markdown(_escape_dollars(answer))
+            except Exception as e:
+                st.error(f"Something went wrong: {str(e)}")
+
+st.divider()
+st.caption("⚠️ This tool is for informational purposes only and does not constitute financial advice.")
